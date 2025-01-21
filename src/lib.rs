@@ -20,11 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-// FFI helpers. This will be removed when these helpers get added to the
-// Suricata rust code (where they belong).
-mod ffi;
-
 use redis::Commands;
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +30,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use suricata::conf::ConfNode;
-use suricata::{SCLogError, SCLogNotice};
+use suricata::{SCLogError, SCLogNotice, SCLogWarning};
 
 // Default configuration values.
 const DEFAULT_HOST: &str = "127.0.0.1";
@@ -190,7 +187,7 @@ impl Redis {
                 }
                 Ok(connection) => connection,
             };
-            SCLogNotice!("Redis conneciton opened");
+            SCLogNotice!("Redis connection opened");
 
             while let Some(buf) = iter.peek() {
                 self.count += 1;
@@ -222,7 +219,6 @@ impl Redis {
 
 struct Context {
     tx: SyncSender<String>,
-    thread: Option<ThreadContext>,
     th: JoinHandle<()>,
     done: Arc<AtomicBool>,
 }
@@ -271,7 +267,7 @@ impl ThreadContext {
 
 unsafe extern "C" fn output_init(
     conf: *const c_void,
-    threaded: bool,
+    _threaded: bool,
     init_data: *mut *mut c_void,
 ) -> c_int {
     // Load configuration.
@@ -299,11 +295,6 @@ unsafe extern "C" fn output_init(
     let context = Context {
         tx: tx.clone(),
         th,
-        thread: if threaded {
-            None
-        } else {
-            Some(ThreadContext::new(1, tx))
-        },
         done,
     };
 
@@ -314,9 +305,6 @@ unsafe extern "C" fn output_init(
 unsafe extern "C" fn output_close(init_data: *const c_void) {
     let context = Box::from_raw(init_data as *mut Context);
     context.done.store(true, Ordering::Relaxed);
-    if let Some(thread) = context.thread {
-        thread.log_exit_stats();
-    }
 
     // Need to drop the transmit side of the channel before waiting for the
     // Redis thread to finish.
@@ -329,27 +317,25 @@ unsafe extern "C" fn output_close(init_data: *const c_void) {
 unsafe extern "C" fn output_write(
     buffer: *const c_char,
     buffer_len: c_int,
-    init_data: *const c_void,
+    _init_data: *const c_void,
     thread_data: *const c_void,
 ) -> c_int {
-    let context = &mut *(init_data as *mut Context);
+    let thread_context = &mut *(thread_data as *mut ThreadContext);
 
-    // If thread_data is null then we're setup for single threaded mode, and use
-    // the default thread context.
-    let thread_context = if thread_data.is_null() {
-        context.thread.as_mut().unwrap()
-    } else {
-        &mut *(thread_data as *mut ThreadContext)
-    };
+    match CStr::from_bytes_with_nul_unchecked(std::slice::from_raw_parts(
+        buffer as *const u8,
+        buffer_len as usize + 1,
+    ))
+    .to_str()
+    {
+        Ok(buf) => {
+            thread_context.send(buf);
+        }
+        Err(err) => {
+            SCLogWarning!("Failed to convert C string to Rust string: {:?}", err);
+        }
+    }
 
-    // Convert the C string to a Rust string.
-    let buf = if let Ok(buf) = ffi::str_from_c_parts(buffer, buffer_len) {
-        buf
-    } else {
-        return -1;
-    };
-
-    thread_context.send(buf);
     0
 }
 
@@ -371,7 +357,7 @@ unsafe extern "C" fn output_thread_deinit(_init_data: *const c_void, thread_data
 }
 
 unsafe extern "C" fn init_plugin() {
-    let file_type = ffi::SCEveFileType::new(
+    let file_type = suricata::ffi::eve::EveFileType::new(
         "eve-redis-plugin",
         output_init,
         output_close,
@@ -379,14 +365,14 @@ unsafe extern "C" fn init_plugin() {
         output_thread_init,
         output_thread_deinit,
     );
-    ffi::SCRegisterEveFileType(file_type);
+    suricata::ffi::eve::SCRegisterEveFileType(file_type);
 }
 
 #[no_mangle]
-extern "C" fn SCPluginRegister() -> *const ffi::SCPlugin {
+extern "C" fn SCPluginRegister() -> *const suricata::plugin::SCPlugin {
     // Rust plugins need to initialize some Suricata internals so stuff like logging works.
     suricata::plugin::init();
 
     // Register our plugin.
-    ffi::SCPlugin::new("Redis Eve Filetype", "GPL-2.0", "Jason Ish", init_plugin)
+    suricata::plugin::SCPlugin::new("Redis Eve Filetype", "GPL-2.0", "Jason Ish", init_plugin)
 }
